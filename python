@@ -1,0 +1,311 @@
+
+import pygame as pg
+import math, random, sys
+
+W, H = 960, 540
+WATERLINE = int(H * 0.62)
+FPS = 60
+
+class Player:
+    def __init__(self):
+        self.x = W * 0.25
+        self.y = WATERLINE
+        self.vx = 0.0
+        self.vy = 0.0
+        self.on_wave = True
+        self.angle = 0.0
+        self.width = 38
+        self.height = 14
+        self.invuln = 0.0
+        self.lives = 3
+
+class Game:
+    def __init__(self):
+        pg.init()
+        self.screen = pg.display.set_mode((W, H))
+        pg.display.set_caption("Surf Dash — Python")
+        self.clock = pg.time.Clock()
+        self.font = pg.font.SysFont(None, 22)
+        self.big = pg.font.SysFont(None, 46)
+        self.running = True
+        self.paused = False
+        self.game_over = False
+        self.muted = True
+        self.reset()
+
+        # lightweight sounds
+        try:
+            pg.mixer.init()
+            self.snd_pick = self._beep(880, 80)
+            self.snd_hit = self._beep(220, 120)
+            self.snd_jump = self._beep(740, 90)
+        except Exception:
+            self.muted = True
+            self.snd_pick = self.snd_hit = self.snd_jump = None
+
+    def _beep(self, freq, ms):
+        # simple square wave tone
+        sample_rate = 22050
+        n_samples = int(sample_rate * ms / 1000)
+        buf = bytearray()
+        period = int(sample_rate / max(1, freq))
+        for i in range(n_samples):
+            v = 127 if (i % period) < (period // 2) else -128
+            buf += int(v & 0xFF).to_bytes(1, 'little', signed=False)
+        snd = pg.mixer.Sound(buffer=bytes(buf))
+        snd.set_volume(0.15)
+        return snd
+
+    def play(self, snd):
+        if not self.muted and snd:
+            snd.play()
+
+    def wave_height(self, x, t):
+        return (
+            math.sin((x * 0.004 + t * 0.8)) * 16 +
+            math.sin((x * 0.009 - t * 0.6)) * 10 +
+            math.sin((x * 0.002 - t * 0.25)) * 24
+        )
+
+    def reset(self):
+        self.t = 0.0
+        self.world_speed = 2.2
+        self.difficulty = 1.0
+        self.player = Player()
+        self.player.y = WATERLINE + self.wave_height(self.player.x, 0) - 6
+        self.pickups = []  # dicts: x,y,r
+        self.hazards = []  # dicts: x,y,r,kind
+        self.splashes = [] # dicts: x,y,t
+        self.score = 0
+        self.best = getattr(self, 'best', 0)
+        self.game_over = False
+        self.paused = False
+
+    def spawn(self, dt):
+        if random.random() < 0.02 * self.difficulty:
+            self.pickups.append({
+                'x': W + 40,
+                'y': WATERLINE - 50 - random.random() * 70,
+                'r': 9,
+                'taken': False,
+            })
+        if random.random() < 0.018 * self.difficulty:
+            kind = 'rock' if random.random() < 0.55 else 'shark'
+            self.hazards.append({
+                'x': W + 60,
+                'y': WATERLINE + (-6 if kind == 'rock' else 4),
+                'r': 12 if kind == 'rock' else 16,
+                'kind': kind,
+                'hit': False,
+            })
+        self.difficulty += dt * 0.015
+        self.world_speed = 2.2 + (self.difficulty - 1) * 0.9
+
+    def draw_background(self):
+        s = self.screen
+        # sky gradient (two rects fake gradient)
+        s.fill((102, 204, 255))
+        pg.draw.rect(s, (201, 241, 255), pg.Rect(0, H//3, W, H))
+        # sun
+        pg.draw.circle(s, (255, 224, 138), (int(W*0.85), int(H*0.18)), 50)
+        # distant mountains
+        for i, col in enumerate([(147, 208, 255), (130, 197, 255), (112, 185, 255)]):
+            baseY = int(H * (0.40 + i * 0.04))
+            pts = [(0, baseY)]
+            for x in range(0, W + 12, 12):
+                y = baseY + math.sin((x + self.t * (0.2 + i * 0.05)) * 0.01) * (6 + i * 3)
+                pts.append((x, int(y)))
+            pts += [(W, 0), (0, 0)]
+            pg.draw.polygon(s, col, pts)
+        # water
+        pg.draw.rect(s, (45, 179, 255), pg.Rect(0, WATERLINE, W, H - WATERLINE))
+        # wave polyline
+        pts = []
+        for x in range(0, W + 6, 6):
+            y = WATERLINE + self.wave_height(x + self.t * 120, self.t * 0.02)
+            pts.append((x, int(y)))
+        pg.draw.lines(s, (255, 255, 255), False, pts, 2)
+        # foam flecks
+        for i in range(60):
+            x = int((i * 67 + (self.t * 120) % W) % W)
+            y = int(WATERLINE + self.wave_height(x + self.t * 120, self.t * 0.02) + 6 + math.sin(i + self.t) * 3)
+            s.fill((255, 255, 255), (x, y, 2, 2))
+
+    def draw_player(self):
+        p = self.player
+        # board
+        cx, cy = int(p.x), int(p.y)
+        surf = pg.Surface((p.width*2, p.height*4), pg.SRCALPHA)
+        # draw surfboard (capsule-ish)
+        pg.draw.polygon(surf, (255, 93, 93), [
+            (0, p.height*2), (p.width, 0), (p.width*2, p.height*2), (p.width, p.height*4)
+        ])
+        # rider
+        rider_col = (255,255,255,200) if p.invuln > 0 else (34,34,34,255)
+        pg.draw.ellipse(surf, rider_col, pg.Rect(p.width+4-5, p.height*2-16, 10, 16))
+        rotated = pg.transform.rotate(surf, -math.degrees(p.angle))
+        rect = rotated.get_rect(center=(cx, cy))
+        self.screen.blit(rotated, rect)
+
+    def draw_pickups(self, dt):
+        for it in self.pickups:
+            it['x'] -= self.world_speed * 60 * dt
+            pg.draw.circle(self.screen, (255, 217, 94), (int(it['x']), int(it['y'])), it['r'])
+            # twinkle
+            pg.draw.line(self.screen, (255, 241, 168), (int(it['x']-it['r']), int(it['y'])), (int(it['x']+it['r']), int(it['y'])), 1)
+            pg.draw.line(self.screen, (255, 241, 168), (int(it['x']), int(it['y']-it['r'])), (int(it['x']), int(it['y']+it['r'])), 1)
+        self.pickups = [it for it in self.pickups if it['x'] > -20 and not it['taken']]
+
+    def draw_hazards(self, dt):
+        for h in self.hazards:
+            h['x'] -= self.world_speed * 65 * dt
+            if h['kind'] == 'rock':
+                pts = [(h['x']-16, h['y']+8), (h['x'], h['y']-8), (h['x']+16, h['y']+6)]
+                pg.draw.polygon(self.screen, (78, 111, 122), list(map(lambda p:(int(p[0]), int(p[1])), pts)))
+            else:
+                pts = [(h['x']-10, h['y']+10), (h['x'], h['y']-12), (h['x']+10, h['y']+10)]
+                pg.draw.polygon(self.screen, (45, 69, 80), list(map(lambda p:(int(p[0]), int(p[1])), pts)))
+        self.hazards = [h for h in self.hazards if h['x'] > -40 and not h['hit']]
+
+    def collide(self, ax, ay, ar, bx, by, br):
+        dx, dy = ax - bx, ay - by
+        return dx*dx + dy*dy <= (ar+br)*(ar+br)
+
+    def update_player(self, dt):
+        p = self.player
+        targetY = WATERLINE + self.wave_height(p.x + self.t * 120, self.t * 0.02) - 6
+        keys = pg.key.get_pressed()
+        accel = 200 * dt
+        if keys[pg.K_LEFT] or keys[pg.K_a]:
+            p.vx -= accel
+        if keys[pg.K_RIGHT] or keys[pg.K_d]:
+            p.vx += accel
+        p.vx *= 0.985
+        p.x += p.vx * dt
+        p.x = max(40, min(W - 60, p.x))
+
+        if (keys[pg.K_SPACE]) and p.on_wave:
+            p.vy = -320
+            p.on_wave = False
+            self.play(self.snd_jump)
+        gravity = 800 * dt
+        if not p.on_wave:
+            p.vy += gravity
+            p.y += p.vy * dt
+            if p.y >= targetY:
+                p.y = targetY
+                p.vy = 0
+                p.on_wave = True
+                self.splashes.append({'x': p.x, 'y': p.y + 8, 't': 0.0})
+        else:
+            p.y += (targetY - p.y) * 0.25
+
+        slope = (self.wave_height(p.x + 2 + self.t * 120, self.t * 0.02) -
+                 self.wave_height(p.x - 2 + self.t * 120, self.t * 0.02)) / 4
+        p.angle = math.atan2(slope - p.vy * 0.002, 1) * 0.8
+
+        if p.invuln > 0:
+            p.invuln -= dt
+
+        for it in self.pickups:
+            if (not it['taken']) and self.collide(p.x, p.y, 14, it['x'], it['y'], it['r']):
+                it['taken'] = True
+                self.score += 25
+                self.play(self.snd_pick)
+
+        for h in self.hazards:
+            if (not h['hit']) and p.invuln <= 0 and self.collide(p.x, p.y + 6, 16, h['x'], h['y'], h['r'] + 4):
+                h['hit'] = True
+                p.invuln = 1.2
+                p.vx *= -0.4
+                p.vy = -220
+                p.on_wave = False
+                self.splashes.append({'x': p.x, 'y': p.y + 8, 't': 0.0})
+                p.lives -= 1
+                self.play(self.snd_hit)
+                if p.lives <= 0:
+                    self.game_over = True
+                    self.paused = True
+
+    def draw_splashes(self, dt):
+        keep = []
+        for sp in self.splashes:
+            sp['t'] += dt
+            if sp['t'] < 0.5:
+                keep.append(sp)
+                r = 14 + sp['t'] * 26
+                alpha = max(0, 255 - int(sp['t'] * 2 * 255))
+                surf = pg.Surface((int(r*2), int(r*2)), pg.SRCALPHA)
+                pg.draw.circle(surf, (255,255,255,alpha), (int(r), int(r)), int(r))
+                self.screen.blit(surf, (int(sp['x']-r), int(sp['y']-r)))
+        self.splashes = keep
+
+    def draw_hud(self):
+        bar = pg.Surface((W, 40), pg.SRCALPHA)
+        bar.fill((0,0,0,70))
+        self.screen.blit(bar, (0,0))
+        txt1 = self.font.render(f"Score: {self.score}", True, (255,255,255))
+        txt2 = self.font.render(f"Best: {self.best}", True, (255,255,255))
+        self.screen.blit(txt1, (12, 10))
+        self.screen.blit(txt2, (120, 10))
+        for i in range(self.player.lives):
+            pg.draw.circle(self.screen, (255,107,107), (W - (20 + i*16), 20), 6)
+
+        if self.paused:
+            overlay = pg.Surface((W, H), pg.SRCALPHA)
+            overlay.fill((0,0,0,120))
+            self.screen.blit(overlay, (0,0))
+            title = self.big.render("Wipeout!" if self.game_over else "Paused", True, (255,255,255))
+            hint1 = self.font.render("Left/Right to steer  •  Space to jump", True, (255,255,255))
+            hint2 = self.font.render("Press R to restart  •  P to pause", True, (255,255,255))
+            self.screen.blit(title, title.get_rect(center=(W//2, H//2 - 30)))
+            self.screen.blit(hint1, hint1.get_rect(center=(W//2, H//2 + 4)))
+            self.screen.blit(hint2, hint2.get_rect(center=(W//2, H//2 + 26)))
+
+    def handle_events(self):
+        for e in pg.event.get():
+            if e.type == pg.QUIT:
+                self.running = False
+            elif e.type == pg.KEYDOWN:
+                if e.key == pg.K_p:
+                    self.paused = not self.paused
+                elif e.key == pg.K_r:
+                    self.reset()
+                elif e.key == pg.K_m:
+                    self.muted = not self.muted
+
+    def loop(self):
+        last = pg.time.get_ticks()
+        while self.running:
+            self.handle_events()
+            now = pg.time.get_ticks()
+            dt = min(33, now - last) / 1000.0
+            last = now
+
+            if not self.paused:
+                self.t += dt
+                self.spawn(dt)
+
+            self.draw_background()
+            if not self.paused:
+                self.draw_pickups(dt)
+                self.draw_hazards(dt)
+                self.update_player(dt)
+            else:
+                self.draw_pickups(0)
+                self.draw_hazards(0)
+            self.draw_player()
+            self.draw_splashes(dt if not self.paused else 0)
+
+            # score increases over time
+            if not self.paused and not self.game_over:
+                self.score += int(dt * 10)
+            self.best = max(self.best, self.score)
+
+            self.draw_hud()
+            pg.display.flip()
+            self.clock.tick(FPS)
+        pg.quit()
+
+if __name__ == '__main__':
+    Game().loop()
